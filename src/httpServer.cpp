@@ -1,5 +1,7 @@
 #include <arpa/inet.h>
+#include <asm-generic/socket.h>
 #include <csignal>
+#include <httpServer/directoryHandler.hpp>
 #include <httpServer/httpServer.hpp>
 #include <iostream>
 #include <netinet/in.h>
@@ -17,14 +19,22 @@ void exitWithFailure(const std::string message) {
 }
 
 void log(std::string message) { std::cout << message << std::endl; }
+
+void printHttpResponse(struct http::httpRequest response) {
+  std::cout << "Type: " << response.requestType
+            << "\nContentType: " << response.contentType
+            << "\nContentLenght: " << response.contentLenght
+            << "\nRoute: " << response.route << "\nBody: " << response.body
+            << std::endl;
+}
 } // namespace
 
 namespace http {
 TcpServer *TcpServer::instance = nullptr;
 
-TcpServer::TcpServer(const char *ipAddress, int port)
+TcpServer::TcpServer(const char *ipAddress, int port, const char *dir)
     : ipAddress(ipAddress), port(port), socketFd(), incommingMessage(), addr(),
-      addrLen(sizeof(addr)) {
+      addrLen(sizeof(addr)), dirHandler(dir) {
   addr.sin_family = AF_INET;
   addr.sin_port = htons(port);
   addr.sin_addr.s_addr = inet_addr(ipAddress);
@@ -37,9 +47,9 @@ TcpServer::TcpServer(const char *ipAddress, int port)
   }
 }
 
-TcpServer::TcpServer(int port)
+TcpServer::TcpServer(int port, const char *dir)
     : ipAddress(), port(port), socketFd(), incommingMessage(), addr(),
-      addrLen(sizeof(addr)) {
+      addrLen(sizeof(addr)), dirHandler(dir) {
   addr.sin_family = AF_INET;
   addr.sin_port = htons(port);
   addr.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -60,14 +70,18 @@ void TcpServer::handleSignal(int sigint) {
   }
 }
 
-void TcpServer::handleSignalImpl(int sigint) {
-  closeServer();
-}
+void TcpServer::handleSignalImpl(int sigint) { closeServer(); }
 
 int TcpServer::startServer() {
   signal(SIGINT, handleSignal);
   socketFd = socket(AF_INET, SOCK_STREAM, 0);
   if (socketFd < 0) {
+    return 1;
+  }
+
+  int opt = 1;
+  if (setsockopt(socketFd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt,
+                 sizeof(opt))) {
     return 1;
   }
 
@@ -80,6 +94,7 @@ int TcpServer::startServer() {
 
 void TcpServer::closeServer() {
   close(socketFd);
+  close(newSocket);
   exit(EXIT_SUCCESS);
 }
 
@@ -103,12 +118,12 @@ void TcpServer::startListen() {
     if (bytesRecieved < 0) {
       exitWithFailure("Failed to recieve data");
     }
+    auto request = parseHttpResquest(std::string(buffer));
+    if (request.route != "/favicon.ico") {
+      auto response = handleHttpRequest(request);
+      sendResponse(response);
+    }
 
-    std::ostringstream ss;
-    ss << "Data recieved: " << buffer;
-    log(ss.str());
-
-    sendResponse();
     close(newSocket);
   }
 }
@@ -123,13 +138,58 @@ void TcpServer::acceptConnections(int &new_socket) {
   }
 }
 
-void TcpServer::sendResponse() {
+struct httpRequest TcpServer::parseHttpResquest(std::string request) {
+  struct httpRequest parsedResponse;
+  std::istringstream responseStream(request);
+
+  std::cout << request << std::endl;
+
+  std::string line;
+  std::getline(responseStream, line);
+  std::istringstream statusLine(line);
+  statusLine >> parsedResponse.requestType;
+  statusLine >> parsedResponse.route;
+
+  while (std::getline(responseStream, line) && line != "\r") {
+    auto colonPos = line.find(':');
+    if (colonPos != std::string::npos) {
+      std::string headerName = line.substr(0, colonPos);
+      std::string headerValue = line.substr(colonPos + 2); // Skip ": "
+
+      if (headerName == "Content-Type") {
+        parsedResponse.contentType = headerValue;
+      } else if (headerName == "Content-Length") {
+        parsedResponse.contentLenght = std::stoi(headerValue);
+      }
+    }
+  }
+
+  std::getline(responseStream, parsedResponse.body, '\0');
+  return parsedResponse;
+}
+
+struct httpResponse TcpServer::handleHttpRequest(struct httpRequest request) {
+  std::cout << request.route;
+  auto response = dirHandler.getHtmlContent(request.route);
+  return response;
+}
+
+void TcpServer::sendResponse(struct httpResponse response) {
   long bytesSent;
   std::string message;
-  std::cin >> message;
-  bytesSent = write(newSocket, message.c_str(), message.size());
+  std::ostringstream ss;
 
-  if (bytesSent == message.size()) {
+  std::cout << response.isDirectory << '\n';
+  if (response.isDirectory)
+    ss << "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: ";
+  else
+    ss << "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ";
+
+  ss << std::to_string(response.content->size()) << "\r\n\r\n"
+     << response.content->c_str();
+  bytesSent = write(newSocket, ss.str().c_str(), ss.str().size());
+
+  if (bytesSent == ss.str().size()) {
     log("Message sent");
   } else {
     log("Message not sent");
